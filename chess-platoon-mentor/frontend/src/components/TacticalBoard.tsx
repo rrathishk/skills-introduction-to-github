@@ -22,12 +22,16 @@ export interface TacticalBoardProps {
   fen: string;
   disabled?: boolean;
   onAttemptMove: (uci: string) => void;
+  darkColor?: string;
+  lightColor?: string;
 }
 
 export default function TacticalBoard({
   fen,
   disabled = false,
   onAttemptMove,
+  darkColor = "#2e3b27",
+  lightColor = "#7d8b78",
 }: TacticalBoardProps) {
   // A fresh validator per render keyed on FEN.
   const validator = useMemo(() => {
@@ -83,8 +87,8 @@ export default function TacticalBoard({
           borderRadius: "6px",
           boxShadow: "inset 0 0 24px rgba(0,0,0,0.6)",
         }}
-        customDarkSquareStyle={{ backgroundColor: "#2e3b27" }}
-        customLightSquareStyle={{ backgroundColor: "#7d8b78" }}
+        customDarkSquareStyle={{ backgroundColor: darkColor }}
+        customLightSquareStyle={{ backgroundColor: lightColor }}
         boardWidth={520}
       />
     </div>

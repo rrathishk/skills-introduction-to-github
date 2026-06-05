@@ -29,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import database as db
+from .academy import academy_payload
 from .agent import CommandAgent
 from .engine import (
     SCENARIOS,
@@ -36,6 +37,7 @@ from .engine import (
     analyse_flaws,
     get_scenario,
 )
+from .factions import FACTIONS, faction_public, get_faction
 
 app = FastAPI(
     title="Psychological Chess Platoon Command Center",
@@ -76,11 +78,17 @@ def _startup() -> None:
 class NewGameRequest(BaseModel):
     user_id: str = Field(..., description="Stable identifier for the commander.")
     level: int = Field(1, ge=1, le=4)
+    faction: Optional[str] = Field(None, description="Army faction id (india/usa/russia/china).")
 
 
 class MoveRequest(BaseModel):
     user_id: str
     move: str = Field(..., description="Commander move in UCI, e.g. 'e2e4'.")
+
+
+class FactionRequest(BaseModel):
+    user_id: str
+    faction: str
 
 
 # ---------------------------------------------------------------------------
@@ -117,18 +125,42 @@ def scenarios():
     }
 
 
+@app.get("/api/factions")
+def factions():
+    return {"factions": [faction_public(f) for f in FACTIONS.values()]}
+
+
+@app.post("/api/set-faction")
+def set_faction(req: FactionRequest):
+    commander = db.set_faction(req.user_id, req.faction)
+    return {"user_id": req.user_id, "faction": faction_public(get_faction(commander["faction"]))}
+
+
+@app.get("/api/academy")
+def academy(user_id: Optional[str] = None):
+    rank_names = None
+    if user_id:
+        commander = db.get_or_create_commander(user_id)
+        rank_names = get_faction(commander["faction"]).rank_names
+    return academy_payload(rank_names)
+
+
 @app.post("/api/new-game")
 def new_game(req: NewGameRequest):
     scenario = get_scenario(req.level)
     db.get_or_create_commander(req.user_id)
+    if req.faction:
+        db.set_faction(req.user_id, req.faction)
+
     _SESSIONS[req.user_id] = {
         "level": scenario.level,
         "fen": scenario.fen,
         "history": [],  # SAN of commander moves, for timeline analysis
     }
 
-    # Opening transmission sets the scene in-character.
+    # Opening transmission sets the scene in-character, in the faction's voice.
     commander = db.get_or_create_commander(req.user_id)
+    faction = get_faction(commander["faction"])
     focus = db.dominant_flaw(req.user_id)
     eased = commander["difficulty_bias"] < 0
     transmission = agent.transmit(
@@ -138,6 +170,9 @@ def new_game(req: NewGameRequest):
         flaws=[],
         focus_flaw=focus,
         eased=eased,
+        general=faction.general,
+        general_title=faction.general_title,
+        motto=faction.motto,
     )
 
     return {
@@ -149,6 +184,7 @@ def new_game(req: NewGameRequest):
         "fen": scenario.fen,
         "transmission": transmission,
         "eased": eased,
+        "faction": faction_public(faction),
     }
 
 
@@ -183,12 +219,13 @@ def move(req: MoveRequest):
 
     focus = db.dominant_flaw(req.user_id)
     eased = commander["difficulty_bias"] < 0
+    faction = get_faction(commander["faction"])
 
     # --- Record match result if the engagement ended
     if outcome.game_over and outcome.result:
         commander = db.record_result(req.user_id, level, outcome.result)
 
-    # --- Agent transmission
+    # --- Agent transmission (in the faction general's voice)
     transmission = agent.transmit(
         level_briefing=scenario.briefing,
         moved_asset=outcome.moved_asset,
@@ -199,6 +236,9 @@ def move(req: MoveRequest):
         focus_flaw=focus,
         eased=eased,
         fen=outcome.fen,
+        general=faction.general,
+        general_title=faction.general_title,
+        motto=faction.motto,
     )
 
     db.log_diagnostic(
@@ -243,6 +283,7 @@ def progress(user_id: str):
         "flaw_counts": commander["flaw_counts"],
         "difficulty_bias": commander["difficulty_bias"],
         "dominant_flaw": db.dominant_flaw(user_id),
+        "faction": faction_public(get_faction(commander["faction"])),
         "match_history": db.get_match_history(user_id, limit=20),
     }
 

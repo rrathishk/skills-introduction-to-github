@@ -3,11 +3,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import TacticalBoard from "@/components/TacticalBoard";
 import CommsSidebar, { CommsEntry } from "@/components/CommsSidebar";
+import FactionPicker, { Faction } from "@/components/FactionPicker";
+import Academy, { AcademyData } from "@/components/Academy";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
-// Stable per-browser commander id so progress persists across reloads.
 function getUserId(): string {
   if (typeof window === "undefined") return "commander";
   let id = window.localStorage.getItem("cc_user_id");
@@ -35,6 +35,7 @@ interface Progress {
   flaw_counts: Record<string, number>;
   dominant_flaw: string | null;
   difficulty_bias: number;
+  faction?: Faction;
 }
 
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -56,25 +57,42 @@ export default function WarRoom() {
   const [liveAgent, setLiveAgent] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [factions, setFactions] = useState<Faction[]>([]);
+  const [faction, setFaction] = useState<Faction | null>(null);
+  const [academyData, setAcademyData] = useState<AcademyData | null>(null);
+  const [showAcademy, setShowAcademy] = useState(false);
   const startedRef = useRef(false);
+
+  const accent = faction?.colors.accent ?? "#5ef38c";
+  const darkSq = faction?.colors.dark ?? "#2e3b27";
+  const lightSq = faction?.colors.light ?? "#7d8b78";
 
   const pushEntry = useCallback((e: Omit<CommsEntry, "id">) => {
     setEntries((prev) => [...prev, newEntry(e)]);
   }, []);
 
-  const loadProgress = useCallback(
-    async (uid: string) => {
-      try {
-        const res = await fetch(`${API_BASE}/api/progress/${uid}`);
-        if (res.ok) setProgress(await res.json());
-      } catch {
-        /* non-fatal */
+  const loadProgress = useCallback(async (uid: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/progress/${uid}`);
+      if (res.ok) {
+        const data = await res.json();
+        setProgress(data);
+        if (data.faction) setFaction(data.faction);
       }
-    },
-    [],
-  );
+    } catch {
+      /* non-fatal */
+    }
+  }, []);
 
-  // -- bootstrap: health, scenarios, first game ---------------------------
+  const loadAcademy = useCallback(async (uid: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/academy?user_id=${uid}`);
+      if (res.ok) setAcademyData(await res.json());
+    } catch {
+      /* non-fatal */
+    }
+  }, []);
+
   useEffect(() => {
     const uid = getUserId();
     setUserId(uid);
@@ -90,34 +108,60 @@ export default function WarRoom() {
       }
 
       try {
-        const res = await fetch(`${API_BASE}/api/scenarios`);
-        const data = await res.json();
-        setScenarios(data.scenarios ?? []);
+        const [sc, fc] = await Promise.all([
+          fetch(`${API_BASE}/api/scenarios`).then((r) => r.json()),
+          fetch(`${API_BASE}/api/factions`).then((r) => r.json()),
+        ]);
+        setScenarios(sc.scenarios ?? []);
+        setFactions(fc.factions ?? []);
       } catch {
         /* non-fatal */
       }
 
+      await loadProgress(uid);
+      await loadAcademy(uid);
+
+      // First-time commanders start at the Academy.
+      const seen = window.localStorage.getItem("cc_seen_academy");
+      if (!seen) setShowAcademy(true);
+
       if (!startedRef.current) {
         startedRef.current = true;
         await startGame(1, uid);
-        await loadProgress(uid);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function startGame(level: number, uid: string) {
+  async function chooseFaction(id: string) {
+    const f = factions.find((x) => x.id === id) ?? null;
+    setFaction(f);
+    try {
+      await fetch(`${API_BASE}/api/set-faction`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, faction: id }),
+      });
+      await loadAcademy(userId); // refresh academy with faction-flavoured names
+    } catch {
+      /* non-fatal */
+    }
+    await startGame(activeLevel, userId, id);
+  }
+
+  async function startGame(level: number, uid: string, factionId?: string) {
     setPending(true);
     setGameOver(false);
     try {
       const res = await fetch(`${API_BASE}/api/new-game`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: uid, level }),
+        body: JSON.stringify({ user_id: uid, level, faction: factionId }),
       });
       const data = await res.json();
       setActiveLevel(data.level);
       setFen(data.fen);
+      if (data.faction) setFaction(data.faction);
       setEntries([
         newEntry({
           kind: "system",
@@ -152,7 +196,6 @@ export default function WarRoom() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ user_id: userId, move: uci }),
         });
-
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           pushEntry({
@@ -161,10 +204,8 @@ export default function WarRoom() {
           });
           return;
         }
-
         const data = await res.json();
         setFen(data.fen);
-
         if (data.flaws && data.flaws.length > 0) {
           pushEntry({
             kind: "flaw",
@@ -172,9 +213,7 @@ export default function WarRoom() {
             flaws: data.flaws,
           });
         }
-
         pushEntry({ kind: "agent", text: data.transmission });
-
         if (data.game_over) {
           setGameOver(true);
           const label =
@@ -185,7 +224,6 @@ export default function WarRoom() {
               : "DRAW — stalemate on the field.";
           pushEntry({ kind: "result", text: label });
         }
-
         await loadProgress(userId);
       } catch {
         pushEntry({ kind: "system", text: "Transmission lost. Check the gateway link." });
@@ -196,33 +234,51 @@ export default function WarRoom() {
     [gameOver, pending, userId, pushEntry, loadProgress],
   );
 
+  function closeAcademy() {
+    window.localStorage.setItem("cc_seen_academy", "1");
+    setShowAcademy(false);
+  }
+
   return (
     <main className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 px-6 py-8">
-      {/* Header */}
+      {showAcademy && academyData && (
+        <Academy data={academyData} accent={accent} onClose={closeAcademy} />
+      )}
+
       <header className="flex flex-wrap items-end justify-between gap-4 border-b border-warroom-border pb-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-[0.2em] text-warroom-accent">
+          <h1 className="text-2xl font-bold tracking-[0.2em]" style={{ color: accent }}>
             ◆ PLATOON COMMAND CENTER
           </h1>
           <p className="text-xs uppercase tracking-[0.3em] text-warroom-muted">
-            Psychological Warfare Chess Trainer
+            {faction ? `${faction.flag} ${faction.name} — ${faction.general}` : "Psychological Warfare Chess Trainer"}
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <span
-            className={`pulse-dot h-2.5 w-2.5 rounded-full ${
-              connected ? "bg-warroom-accent" : "bg-warroom-danger"
-            }`}
-          />
-          <span className={connected ? "text-warroom-accent" : "text-warroom-danger"}>
-            {connected === null
-              ? "LINKING…"
-              : connected
-              ? "GATEWAY ONLINE :8000"
-              : "GATEWAY OFFLINE"}
+        <div className="flex items-center gap-3 text-xs">
+          <button
+            onClick={() => setShowAcademy(true)}
+            className="rounded border border-warroom-border px-3 py-2 text-warroom-muted hover:border-warroom-accent/60"
+          >
+            📖 ACADEMY
+          </button>
+          <span className="flex items-center gap-2">
+            <span
+              className={`pulse-dot h-2.5 w-2.5 rounded-full ${connected ? "bg-warroom-accent" : "bg-warroom-danger"}`}
+            />
+            <span className={connected ? "text-warroom-accent" : "text-warroom-danger"}>
+              {connected === null ? "LINKING…" : connected ? "GATEWAY ONLINE" : "GATEWAY OFFLINE"}
+            </span>
           </span>
         </div>
       </header>
+
+      {/* Faction selection */}
+      <section>
+        <p className="mb-2 text-[10px] uppercase tracking-[0.3em] text-warroom-muted">
+          Choose Your Army
+        </p>
+        <FactionPicker factions={factions} selectedId={faction?.id} onSelect={chooseFaction} />
+      </section>
 
       {/* Mission selector */}
       <nav className="flex flex-wrap gap-2">
@@ -231,13 +287,16 @@ export default function WarRoom() {
             key={s.level}
             onClick={() => startGame(s.level, userId)}
             disabled={pending}
-            className={`rounded-md border px-3 py-2 text-left text-xs transition ${
-              activeLevel === s.level
-                ? "border-warroom-accent bg-warroom-accent/10 text-warroom-accent"
-                : "border-warroom-border bg-warroom-panel text-warroom-muted hover:border-warroom-accent/50"
-            } disabled:opacity-40`}
+            className="rounded-md border px-3 py-2 text-left text-xs transition disabled:opacity-40"
+            style={{
+              borderColor: activeLevel === s.level ? accent : "#1f2b1a",
+              background: activeLevel === s.level ? `${accent}1a` : "#11160f",
+              color: activeLevel === s.level ? accent : "#7d8b78",
+            }}
           >
-            <span className="block font-bold">LVL {s.level} · {s.codename}</span>
+            <span className="block font-bold">
+              LVL {s.level} · {s.codename}
+            </span>
             <span className="block opacity-70">{s.difficulty}</span>
           </button>
         ))}
@@ -250,28 +309,31 @@ export default function WarRoom() {
             fen={fen}
             disabled={pending || gameOver}
             onAttemptMove={handleAttemptMove}
+            darkColor={darkSq}
+            lightColor={lightSq}
           />
 
-          {/* Diagnostics dossier */}
           <div className="rounded-lg border border-warroom-border bg-warroom-panel p-4 text-xs">
             <p className="mb-2 text-[10px] uppercase tracking-[0.3em] text-warroom-muted">
               Commander Dossier
             </p>
             {progress ? (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <Stat label="Elo" value={String(progress.elo)} />
+                <Stat label="Elo" value={String(progress.elo)} accent={accent} />
                 <Stat
                   label="W / L / D"
                   value={`${progress.wins}/${progress.losses}/${progress.draws}`}
+                  accent={accent}
                 />
-                <Stat label="Win Rate" value={`${Math.round(progress.win_rate * 100)}%`} />
+                <Stat
+                  label="Win Rate"
+                  value={`${Math.round(progress.win_rate * 100)}%`}
+                  accent={accent}
+                />
                 <Stat
                   label="Focus Flaw"
-                  value={
-                    progress.dominant_flaw
-                      ? progress.dominant_flaw.replace(/_/g, " ")
-                      : "none"
-                  }
+                  value={progress.dominant_flaw ? progress.dominant_flaw.replace(/_/g, " ") : "none"}
+                  accent={accent}
                   danger={Boolean(progress.dominant_flaw)}
                 />
               </div>
@@ -287,7 +349,7 @@ export default function WarRoom() {
       </section>
 
       <footer className="border-t border-warroom-border pt-3 text-center text-[10px] uppercase tracking-[0.3em] text-warroom-muted">
-        Commander ID: {userId} · {liveAgent ? "VOSS LIVE" : "VOSS OFFLINE RELAY"}
+        Commander ID: {userId} · {liveAgent ? "VOSS LIVE" : "OFFLINE RELAY"}
       </footer>
     </main>
   );
@@ -296,16 +358,18 @@ export default function WarRoom() {
 function Stat({
   label,
   value,
+  accent,
   danger = false,
 }: {
   label: string;
   value: string;
+  accent: string;
   danger?: boolean;
 }) {
   return (
     <div>
       <p className="text-[10px] uppercase tracking-wide text-warroom-muted">{label}</p>
-      <p className={`text-sm font-bold ${danger ? "text-warroom-danger" : "text-warroom-accent"}`}>
+      <p className="text-sm font-bold" style={{ color: danger ? "#ff5b5b" : accent }}>
         {value}
       </p>
     </div>

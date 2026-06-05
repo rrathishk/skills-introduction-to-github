@@ -25,10 +25,34 @@ chess-platoon-mentor/
 │   │   ├── engine.py         # python-chess integration & scenario states
 │   │   ├── agent.py          # OpenAI persona wrapper (offline fallback built-in)
 │   │   └── database.py       # SQLite progress tracking & diagnostic logs
+│   │   ├── factions.py       # 4 playable armies (India/USA/Russia/China)
+│   │   └── academy.py        # teaching doctrine (rewires how you see the board)
 │   ├── requirements.txt
 │   └── .env
+├── mobile/                   # Expo / React Native app (same backend)
+│   ├── App.tsx
+│   ├── src/api.ts            # shared-backend client
+│   └── src/screens/          # Faction · Academy · War Room
 └── README.md                 # (this file)
 ```
+
+## Choose Your Army
+
+Players pick a faction — **🇮🇳 India**, **🇺🇸 United States**, **🇷🇺 Russia**, or
+**🇨🇳 China**. The choice re-themes the board colors, renames assets into that
+nation's military flavour (e.g. Knight → *Spetsnaz* for Russia, *Para-Commando*
+for India), and gives the AI mentor a named commanding general whose voice the
+transmissions adopt. It is purely cosmetic/psychological — the chess rules are
+identical. Add crest/general artwork under `frontend/public/factions/<id>/`
+(see that folder's README); until then a flag emoji + faction color is used.
+
+## The Academy (teaching layer)
+
+Before the first move, the **Academy** rewires how the player sees the board:
+each piece becomes an army asset with a strength, a deployment doctrine, and a
+psychological lesson — plus the four strategic doctrines (*take position early,
+when to sacrifice, when to accept defeat, when to hold*). Served from
+`/api/academy` and flavoured by the player's faction.
 
 ---
 
@@ -182,6 +206,24 @@ curl http://localhost:8000/api/diagnostics/demo
 | POST   | `/api/move`                  | Submit a move `{user_id, move}` (UCI) |
 | GET    | `/api/progress/{user_id}`    | Elo, record, and flaw flags |
 | GET    | `/api/diagnostics/{user_id}` | Recent diagnostic transmissions log |
+| GET    | `/api/factions`              | The 4 playable armies + theming |
+| POST   | `/api/set-faction`           | Choose an army `{user_id, faction}` |
+| GET    | `/api/academy?user_id=...`   | Teaching doctrine (faction-flavoured) |
+
+## Mobile app (Expo)
+
+The phone app lives in `mobile/` and talks to the **same backend** — nothing is
+hosted twice. Setup:
+
+```bash
+cd chess-platoon-mentor/mobile
+npm install
+npx expo start            # scan the QR code with Expo Go
+```
+
+Point it at your machine: set `extra.apiBase` in `mobile/app.json` to your
+computer's LAN IP (e.g. `http://192.168.1.42:8000`) — on a phone `localhost`
+means the phone, not your dev machine. Full details in `mobile/README.md`.
 
 ---
 

@@ -95,8 +95,23 @@ FLAW_COACHING: Dict[str, Dict[str, str]] = {
 }
 
 
-def _system_prompt(level_briefing: str, focus_flaw: Optional[str], eased: bool) -> str:
-    parts = [PERSONA, "", LEXICON, "", f"CURRENT MISSION BRIEFING: {level_briefing}"]
+def _system_prompt(
+    level_briefing: str,
+    focus_flaw: Optional[str],
+    eased: bool,
+    general: Optional[str] = None,
+    general_title: Optional[str] = None,
+    motto: Optional[str] = None,
+) -> str:
+    parts = [PERSONA]
+    if general:
+        parts.append(
+            f"\nYOU ARE SPEAKING AS {general.upper()}, {general_title or 'Supreme Commander'}. "
+            f"Adopt this commander's authority and bearing. Sign off in their voice. "
+            f"Standing motto of this command: \"{motto or ''}\". Address the human as "
+            "'Commander'."
+        )
+    parts += ["", LEXICON, "", f"CURRENT MISSION BRIEFING: {level_briefing}"]
     if focus_flaw and focus_flaw in FLAW_COACHING:
         coaching = FLAW_COACHING[focus_flaw]
         parts.append(
@@ -204,15 +219,22 @@ class CommandAgent:
         focus_flaw: Optional[str] = None,
         eased: bool = False,
         fen: Optional[str] = None,
+        general: Optional[str] = None,
+        general_title: Optional[str] = None,
+        motto: Optional[str] = None,
     ) -> str:
         """
         Produce a single transmission string. Uses the OpenAI SDK when
         available; otherwise the deterministic offline generator.
         """
         if not self.live:
-            return _fallback_transmission(
+            text = _fallback_transmission(
                 moved_asset, captured_asset, flaws, game_over, result, focus_flaw
             )
+            # In offline mode, still sign the transmission in the general's voice.
+            if general:
+                text = f"{text}\n— {general}"
+            return text
 
         # Build the user-context describing the latest field event.
         event_lines = []
@@ -237,7 +259,10 @@ class CommandAgent:
                 messages=[
                     {
                         "role": "system",
-                        "content": _system_prompt(level_briefing, focus_flaw, eased),
+                        "content": _system_prompt(
+                            level_briefing, focus_flaw, eased,
+                            general, general_title, motto,
+                        ),
                     },
                     {"role": "user", "content": user_context},
                 ],

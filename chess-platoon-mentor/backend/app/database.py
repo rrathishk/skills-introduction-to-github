@@ -75,11 +75,19 @@ def init_db() -> None:
                 draws           INTEGER NOT NULL DEFAULT 0,
                 flaw_counts     TEXT    NOT NULL DEFAULT '{}',
                 difficulty_bias INTEGER NOT NULL DEFAULT 0,
+                faction         TEXT    NOT NULL DEFAULT 'india',
                 created_at      REAL    NOT NULL,
                 updated_at      REAL    NOT NULL
             )
             """
         )
+
+        # Lightweight migration: add `faction` to pre-existing databases.
+        cols = {row["name"] for row in cur.execute("PRAGMA table_info(commanders)")}
+        if "faction" not in cols:
+            cur.execute(
+                "ALTER TABLE commanders ADD COLUMN faction TEXT NOT NULL DEFAULT 'india'"
+            )
 
         # Append-only log of every match result.
         cur.execute(
@@ -144,6 +152,19 @@ def get_or_create_commander(user_id: str) -> Dict[str, Any]:
             cur.execute("SELECT * FROM commanders WHERE user_id = ?", (user_id,))
             row = cur.fetchone()
         return _row_to_commander(row)
+
+
+def set_faction(user_id: str, faction_id: str) -> Dict[str, Any]:
+    """Persist the commander's chosen army faction."""
+    commander = get_or_create_commander(user_id)
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE commanders SET faction = ?, updated_at = ? WHERE user_id = ?",
+            (faction_id, time.time(), user_id),
+        )
+        conn.commit()
+    commander["faction"] = faction_id
+    return commander
 
 
 def record_flaws(user_id: str, flaw_keys: List[str]) -> Dict[str, Any]:

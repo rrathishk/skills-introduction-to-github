@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Chess Platoon",
+    "slug": "chess-platoon-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0a0e0a",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0a0e0a"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.chessplatoon.app"
+    },
+    "android": {
+      "package": "com.chessplatoon.app"
+    },
+    "extra": {
+      "apiBase": "http://192.168.1.100:8000"
+    }
+  }
+}
