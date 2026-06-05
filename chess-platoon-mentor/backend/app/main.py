@@ -26,10 +26,11 @@ import os
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from . import auth
 from . import database as db
 from .academy import academy_payload
 from .agent import CommandAgent
@@ -71,13 +72,6 @@ app.add_middleware(
 
 agent = CommandAgent()
 
-# ---------------------------------------------------------------------------
-# In-memory session store: user_id -> {"level": int, "fen": str, "history": []}
-# NOTE: single-instance only. For multi-instance production, move this to the
-# database or Redis (tracked as a follow-up — see README "Production status").
-# ---------------------------------------------------------------------------
-_SESSIONS: Dict[str, Dict] = {}
-
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -99,6 +93,44 @@ class FactionRequest(BaseModel):
     faction: str
 
 
+class RegisterRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=8, max_length=200)
+    display_name: Optional[str] = Field(None, max_length=120)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+def optional_user_id(authorization: Optional[str] = Header(default=None)) -> Optional[str]:
+    """Return the authenticated user id from a Bearer token, or None.
+
+    When present it OVERRIDES any user_id in the request body/path, so a logged
+    in player's progress is always tied to their account (and follows them
+    across web + mobile). Absent → anonymous play with the body/path id.
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        return auth.decode_token(authorization.split(" ", 1)[1].strip())
+    return None
+
+
+def require_user_id(authorization: Optional[str] = Header(default=None)) -> str:
+    uid = optional_user_id(authorization)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return uid
+
+
+def _user_public(user: Dict) -> Dict:
+    return {"id": user["id"], "email": user["email"], "display_name": user.get("display_name")}
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -114,7 +146,46 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "live_agent": agent.live}
+    return {"status": "ok", "live_agent": agent.live, "auth": True}
+
+
+# ---- Authentication -------------------------------------------------------
+
+@app.post("/api/auth/register")
+def register(req: RegisterRequest):
+    email = req.email.lower().strip()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=422, detail="A valid email is required.")
+    if db.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="An account with that email already exists.")
+    user_id = auth.new_user_id()
+    db.create_user(
+        user_id=user_id,
+        email=email,
+        password_hash=auth.hash_password(req.password),
+        display_name=req.display_name or email.split("@")[0],
+    )
+    db.get_or_create_commander(user_id)  # initialise their progress record
+    return {
+        "token": auth.create_token(user_id),
+        "user": {"id": user_id, "email": email, "display_name": req.display_name or email.split("@")[0]},
+    }
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    user = db.get_user_by_email(req.email)
+    if not user or not auth.verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    return {"token": auth.create_token(user["id"]), "user": _user_public(user)}
+
+
+@app.get("/api/auth/me")
+def me(user_id: str = Depends(require_user_id)):
+    user = db.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Account not found.")
+    return {"user": _user_public(user)}
 
 
 @app.get("/api/scenarios")
@@ -139,37 +210,37 @@ def factions():
 
 
 @app.post("/api/set-faction")
-def set_faction(req: FactionRequest):
-    commander = db.set_faction(req.user_id, req.faction)
-    return {"user_id": req.user_id, "faction": faction_public(get_faction(commander["faction"]))}
+def set_faction(req: FactionRequest, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or req.user_id
+    commander = db.set_faction(uid, req.faction)
+    return {"user_id": uid, "faction": faction_public(get_faction(commander["faction"]))}
 
 
 @app.get("/api/academy")
-def academy(user_id: Optional[str] = None):
+def academy(user_id: Optional[str] = None, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or user_id
     rank_names = None
-    if user_id:
-        commander = db.get_or_create_commander(user_id)
+    if uid:
+        commander = db.get_or_create_commander(uid)
         rank_names = get_faction(commander["faction"]).rank_names
     return academy_payload(rank_names)
 
 
 @app.post("/api/new-game")
-def new_game(req: NewGameRequest):
+def new_game(req: NewGameRequest, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or req.user_id
     scenario = get_scenario(req.level)
-    db.get_or_create_commander(req.user_id)
+    db.get_or_create_commander(uid)
     if req.faction:
-        db.set_faction(req.user_id, req.faction)
+        db.set_faction(uid, req.faction)
 
-    _SESSIONS[req.user_id] = {
-        "level": scenario.level,
-        "fen": scenario.fen,
-        "history": [],  # SAN of commander moves, for timeline analysis
-    }
+    # Persist the fresh game so it survives restarts and is multi-instance safe.
+    db.save_active_session(uid, scenario.level, scenario.fen, [])
 
     # Opening transmission sets the scene in-character, in the faction's voice.
-    commander = db.get_or_create_commander(req.user_id)
+    commander = db.get_or_create_commander(uid)
     faction = get_faction(commander["faction"])
-    focus = db.dominant_flaw(req.user_id)
+    focus = db.dominant_flaw(uid)
     eased = commander["difficulty_bias"] < 0
     transmission = agent.transmit(
         level_briefing=scenario.briefing,
@@ -197,17 +268,19 @@ def new_game(req: NewGameRequest):
 
 
 @app.post("/api/move")
-def move(req: MoveRequest):
-    session = _SESSIONS.get(req.user_id)
+def move(req: MoveRequest, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or req.user_id
+    session = db.get_active_session(uid)
     if session is None:
         raise HTTPException(status_code=400, detail="No active engagement. Call /api/new-game first.")
 
     pre_fen = session["fen"]
     level = session["level"]
+    history = session["history"]
     scenario = get_scenario(level)
 
     # --- Behavioral Flaw Engine (analyse against live + historical timeline)
-    flaws: List[str] = analyse_flaws(pre_fen, req.move, session["history"])
+    flaws: List[str] = analyse_flaws(pre_fen, req.move, history)
 
     # --- Apply the move on the tactical engine
     eng = TacticalEngine(pre_fen)
@@ -216,22 +289,22 @@ def move(req: MoveRequest):
         raise HTTPException(status_code=422, detail=outcome.reason)
 
     # Persist new board + commander move into the session timeline.
-    session["fen"] = outcome.fen
-    session["history"].append(outcome.user_san)
+    history.append(outcome.user_san)
+    db.save_active_session(uid, level, outcome.fen, history)
     outcome.flaws = flaws
 
     # --- Diagnostics persistence + adaptive scaling
-    commander = db.get_or_create_commander(req.user_id)
+    commander = db.get_or_create_commander(uid)
     if flaws:
-        commander = db.record_flaws(req.user_id, flaws)
+        commander = db.record_flaws(uid, flaws)
 
-    focus = db.dominant_flaw(req.user_id)
+    focus = db.dominant_flaw(uid)
     eased = commander["difficulty_bias"] < 0
     faction = get_faction(commander["faction"])
 
     # --- Record match result if the engagement ended
     if outcome.game_over and outcome.result:
-        commander = db.record_result(req.user_id, level, outcome.result)
+        commander = db.record_result(uid, level, outcome.result)
 
     # --- Agent transmission (in the faction general's voice)
     transmission = agent.transmit(
@@ -250,7 +323,7 @@ def move(req: MoveRequest):
     )
 
     db.log_diagnostic(
-        user_id=req.user_id,
+        user_id=uid,
         level=level,
         move=outcome.user_san,
         fen=outcome.fen,
@@ -277,12 +350,13 @@ def move(req: MoveRequest):
 
 
 @app.get("/api/progress/{user_id}")
-def progress(user_id: str):
-    commander = db.get_or_create_commander(user_id)
+def progress(user_id: str, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or user_id
+    commander = db.get_or_create_commander(uid)
     total = commander["wins"] + commander["losses"] + commander["draws"]
     win_rate = (commander["wins"] / total) if total else 0.0
     return {
-        "user_id": user_id,
+        "user_id": uid,
         "elo": commander["elo"],
         "wins": commander["wins"],
         "losses": commander["losses"],
@@ -290,15 +364,16 @@ def progress(user_id: str):
         "win_rate": round(win_rate, 3),
         "flaw_counts": commander["flaw_counts"],
         "difficulty_bias": commander["difficulty_bias"],
-        "dominant_flaw": db.dominant_flaw(user_id),
+        "dominant_flaw": db.dominant_flaw(uid),
         "faction": faction_public(get_faction(commander["faction"])),
-        "match_history": db.get_match_history(user_id, limit=20),
+        "match_history": db.get_match_history(uid, limit=20),
     }
 
 
 @app.get("/api/diagnostics/{user_id}")
-def diagnostics(user_id: str, limit: int = 50):
+def diagnostics(user_id: str, limit: int = 50, auth_uid: Optional[str] = Depends(optional_user_id)):
+    uid = auth_uid or user_id
     return {
-        "user_id": user_id,
-        "diagnostics": db.get_diagnostics(user_id, limit=limit),
+        "user_id": uid,
+        "diagnostics": db.get_diagnostics(uid, limit=limit),
     }

@@ -108,6 +108,30 @@ diagnostics = Table(
     Column("created_at", Float, nullable=False),
 )
 
+# Registered accounts (login). Anonymous play does not create a row here.
+users = Table(
+    "users",
+    _metadata,
+    Column("id", String(64), primary_key=True),
+    Column("email", String(320), nullable=False, unique=True, index=True),
+    Column("password_hash", Text, nullable=False),
+    Column("display_name", String(120)),
+    Column("created_at", Float, nullable=False),
+)
+
+# The player's CURRENT in-progress game. One active game per commander.
+# Moving this out of process memory makes the backend multi-instance safe and
+# survives restarts/redeploys.
+active_sessions = Table(
+    "active_sessions",
+    _metadata,
+    Column("user_id", String(128), primary_key=True),
+    Column("level", Integer, nullable=False),
+    Column("fen", Text, nullable=False),
+    Column("history", Text, nullable=False, default="[]"),  # JSON array of SAN
+    Column("updated_at", Float, nullable=False),
+)
+
 
 def get_engine():
     global _engine
@@ -312,3 +336,74 @@ def get_match_history(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
             .limit(limit)
         ).all()
     return [dict(r._mapping) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Users (accounts)
+# ---------------------------------------------------------------------------
+
+def create_user(user_id: str, email: str, password_hash: str, display_name: str) -> Dict[str, Any]:
+    with get_engine().begin() as conn:
+        conn.execute(
+            insert(users).values(
+                id=user_id,
+                email=email.lower().strip(),
+                password_hash=password_hash,
+                display_name=display_name,
+                created_at=time.time(),
+            )
+        )
+    return {"id": user_id, "email": email.lower().strip(), "display_name": display_name}
+
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            select(users).where(users.c.email == email.lower().strip())
+        ).first()
+    return dict(row._mapping) if row else None
+
+
+def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        row = conn.execute(select(users).where(users.c.id == user_id)).first()
+    return dict(row._mapping) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Active game session (persisted — replaces the old in-memory dict)
+# ---------------------------------------------------------------------------
+
+def save_active_session(user_id: str, level: int, fen: str, history: List[str]) -> None:
+    """Upsert the commander's current in-progress game."""
+    now = time.time()
+    with get_engine().begin() as conn:
+        existing = conn.execute(
+            select(active_sessions.c.user_id).where(active_sessions.c.user_id == user_id)
+        ).first()
+        values = {
+            "level": level,
+            "fen": fen,
+            "history": json.dumps(history),
+            "updated_at": now,
+        }
+        if existing:
+            conn.execute(
+                update(active_sessions)
+                .where(active_sessions.c.user_id == user_id)
+                .values(**values)
+            )
+        else:
+            conn.execute(insert(active_sessions).values(user_id=user_id, **values))
+
+
+def get_active_session(user_id: str) -> Optional[Dict[str, Any]]:
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            select(active_sessions).where(active_sessions.c.user_id == user_id)
+        ).first()
+    if not row:
+        return None
+    data = dict(row._mapping)
+    data["history"] = json.loads(data.get("history") or "[]")
+    return data

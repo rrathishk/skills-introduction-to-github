@@ -5,6 +5,8 @@ import TacticalBoard from "@/components/TacticalBoard";
 import CommsSidebar, { CommsEntry } from "@/components/CommsSidebar";
 import FactionPicker, { Faction } from "@/components/FactionPicker";
 import Academy, { AcademyData } from "@/components/Academy";
+import AuthBar from "@/components/AuthBar";
+import { authHeaders, fetchMe, AuthUser } from "@/lib/auth";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -61,6 +63,7 @@ export default function WarRoom() {
   const [faction, setFaction] = useState<Faction | null>(null);
   const [academyData, setAcademyData] = useState<AcademyData | null>(null);
   const [showAcademy, setShowAcademy] = useState(false);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const startedRef = useRef(false);
 
   const accent = faction?.colors.accent ?? "#5ef38c";
@@ -73,7 +76,7 @@ export default function WarRoom() {
 
   const loadProgress = useCallback(async (uid: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/progress/${uid}`);
+      const res = await fetch(`${API_BASE}/api/progress/${uid}`, { headers: authHeaders() });
       if (res.ok) {
         const data = await res.json();
         setProgress(data);
@@ -86,7 +89,7 @@ export default function WarRoom() {
 
   const loadAcademy = useCallback(async (uid: string) => {
     try {
-      const res = await fetch(`${API_BASE}/api/academy?user_id=${uid}`);
+      const res = await fetch(`${API_BASE}/api/academy?user_id=${uid}`, { headers: authHeaders() });
       if (res.ok) setAcademyData(await res.json());
     } catch {
       /* non-fatal */
@@ -118,6 +121,10 @@ export default function WarRoom() {
         /* non-fatal */
       }
 
+      // Restore a logged-in session if a token is stored.
+      const me = await fetchMe();
+      setAuthUser(me);
+
       await loadProgress(uid);
       await loadAcademy(uid);
 
@@ -139,7 +146,7 @@ export default function WarRoom() {
     try {
       await fetch(`${API_BASE}/api/set-faction`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ user_id: userId, faction: id }),
       });
       await loadAcademy(userId); // refresh academy with faction-flavoured names
@@ -155,7 +162,7 @@ export default function WarRoom() {
     try {
       const res = await fetch(`${API_BASE}/api/new-game`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ user_id: uid, level, faction: factionId }),
       });
       const data = await res.json();
@@ -193,7 +200,7 @@ export default function WarRoom() {
       try {
         const res = await fetch(`${API_BASE}/api/move`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({ user_id: userId, move: uci }),
         });
         if (!res.ok) {
@@ -239,6 +246,14 @@ export default function WarRoom() {
     setShowAcademy(false);
   }
 
+  async function onAuthChange(u: AuthUser | null) {
+    // Logging in/out switches the identity the backend keys off; reload state.
+    setAuthUser(u);
+    await loadProgress(userId);
+    await loadAcademy(userId);
+    await startGame(activeLevel, userId);
+  }
+
   return (
     <main className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 px-6 py-8">
       {showAcademy && academyData && (
@@ -254,7 +269,8 @@ export default function WarRoom() {
             {faction ? `${faction.flag} ${faction.name} — ${faction.general}` : "Psychological Warfare Chess Trainer"}
           </p>
         </div>
-        <div className="flex items-center gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-3 text-xs">
+          <AuthBar user={authUser} accent={accent} onChange={onAuthChange} />
           <button
             onClick={() => setShowAcademy(true)}
             className="rounded border border-warroom-border px-3 py-2 text-warroom-muted hover:border-warroom-accent/60"

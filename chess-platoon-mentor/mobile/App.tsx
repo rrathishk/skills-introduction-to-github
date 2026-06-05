@@ -5,12 +5,13 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import "react-native-gesture-handler";
 
-import { api, Faction, Scenario } from "./src/api";
+import { api, AuthUser, Faction, Scenario } from "./src/api";
+import LoginScreen from "./src/screens/LoginScreen";
 import FactionScreen from "./src/screens/FactionScreen";
 import AcademyScreen from "./src/screens/AcademyScreen";
 import WarRoomScreen from "./src/screens/WarRoomScreen";
 
-type Screen = "faction" | "academy" | "war";
+type Screen = "login" | "faction" | "academy" | "war";
 
 // A stable per-install id. In production, replace with real auth (Supabase).
 function makeUserId(): string {
@@ -18,8 +19,8 @@ function makeUserId(): string {
 }
 
 export default function App() {
-  const [userId] = useState(makeUserId);
-  const [screen, setScreen] = useState<Screen>("faction");
+  const [userId, setUserId] = useState(makeUserId);
+  const [screen, setScreen] = useState<Screen>("login");
   const [factions, setFactions] = useState<Faction[]>([]);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedId, setSelectedId] = useState<string | undefined>();
@@ -61,6 +62,15 @@ export default function App() {
         <SafeAreaView style={s.root} edges={["top", "bottom"]}>
           <StatusBar style="light" />
           <View style={s.root}>
+            {screen === "login" && (
+              <LoginScreen
+                onAuthed={(u: AuthUser) => {
+                  setUserId(u.id); // backend keys off the token; id kept for display
+                  setScreen("faction");
+                }}
+                onGuest={() => setScreen("faction")}
+              />
+            )}
             {screen === "faction" && (
               <FactionScreen
                 factions={factions}

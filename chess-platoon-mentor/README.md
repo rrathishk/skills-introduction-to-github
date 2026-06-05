@@ -209,6 +209,19 @@ curl http://localhost:8000/api/diagnostics/demo
 | GET    | `/api/factions`              | The 4 playable armies + theming |
 | POST   | `/api/set-faction`           | Choose an army `{user_id, faction}` |
 | GET    | `/api/academy?user_id=...`   | Teaching doctrine (faction-flavoured) |
+| POST   | `/api/auth/register`         | Create account `{email, password}` → JWT |
+| POST   | `/api/auth/login`            | Log in `{email, password}` → JWT |
+| GET    | `/api/auth/me`               | Current account (requires `Bearer` token) |
+
+**Login:** send the JWT as `Authorization: Bearer <token>` on any call — the
+backend then ties all progress to that account, so it follows the player across
+web **and** mobile. Anonymous play still works without a token.
+
+**Active games are persisted in the database** (not process memory), so the
+backend is restart-safe and multi-instance ready.
+
+> 📋 **All configuration — env vars, secrets, hosting decisions, and the launch
+> checklist — lives in [`CONFIGURATION.md`](./CONFIGURATION.md).**
 
 ## Mobile app (Expo)
 

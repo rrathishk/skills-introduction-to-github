@@ -12,8 +12,18 @@ import Constants from "expo-constants";
 const API_BASE: string =
   (Constants.expoConfig?.extra as any)?.apiBase ?? "http://localhost:8000";
 
+// In-memory token. For persistence across app restarts, swap this for
+// expo-secure-store (tracked in CONFIGURATION.md → known gaps).
+let _token: string | null = null;
+export function setToken(token: string | null) {
+  _token = token;
+}
+function authHeaders(): Record<string, string> {
+  return _token ? { Authorization: `Bearer ${_token}` } : {};
+}
+
 async function jget<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`);
+  const res = await fetch(`${API_BASE}${path}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`GET ${path} -> ${res.status}`);
   return res.json();
 }
@@ -21,7 +31,7 @@ async function jget<T>(path: string): Promise<T> {
 async function jpost<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -29,6 +39,12 @@ async function jpost<T>(path: string, body: unknown): Promise<T> {
     throw new Error((err as any).detail ?? `POST ${path} -> ${res.status}`);
   }
   return res.json();
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name?: string;
 }
 
 export interface Faction {
@@ -54,6 +70,24 @@ export interface Scenario {
 
 export const api = {
   base: API_BASE,
+  setToken,
+  register: async (email: string, password: string, displayName?: string) => {
+    const data = await jpost<{ token: string; user: AuthUser }>("/api/auth/register", {
+      email,
+      password,
+      display_name: displayName,
+    });
+    setToken(data.token);
+    return data.user;
+  },
+  login: async (email: string, password: string) => {
+    const data = await jpost<{ token: string; user: AuthUser }>("/api/auth/login", {
+      email,
+      password,
+    });
+    setToken(data.token);
+    return data.user;
+  },
   health: () => jget<{ status: string; live_agent: boolean }>("/api/health"),
   scenarios: () => jget<{ scenarios: Scenario[] }>("/api/scenarios"),
   factions: () => jget<{ factions: Faction[] }>("/api/factions"),
