@@ -227,6 +227,51 @@ means the phone, not your dev machine. Full details in `mobile/README.md`.
 
 ---
 
+## Production status & deployment
+
+**The brain is production-ready; a couple of infra items remain.**
+
+| Capability | Status |
+|---|---|
+| Automated test suite (pytest, 22 tests) | ✅ `backend/tests/` |
+| CI: tests on **SQLite + Postgres**, frontend build, Docker build | ✅ `.github/workflows/chess-platoon-ci.yml` |
+| Containerized backend | ✅ `backend/Dockerfile` |
+| Postgres support (same code as SQLite) | ✅ via `DATABASE_URL` |
+| CORS lockdown via env | ✅ `CORS_ORIGINS` |
+| Login / auth (cross-device memory) | ⏳ next |
+| Active-game session store (currently in-memory, single-instance) | ⏳ move to DB/Redis for multi-instance |
+
+### Run the tests
+
+```bash
+cd chess-platoon-mentor/backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+pytest                       # runs on a throwaway SQLite db
+# against Postgres:
+DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/db pytest
+```
+
+### Production environment variables (backend)
+
+| Var | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | Brings the live agent online (blank = offline mode) |
+| `DATABASE_URL` | Postgres URL for production (unset = SQLite file) |
+| `CORS_ORIGINS` | Comma-separated allowlist of front-end domains |
+| `PORT` | Port to bind (set automatically by most hosts) |
+
+### Deploy the backend (Docker)
+
+```bash
+cd chess-platoon-mentor/backend
+docker build -t chess-platoon-backend .
+docker run -p 8000:8000 -e DATABASE_URL=... -e OPENAI_API_KEY=... chess-platoon-backend
+```
+
+Cheapest managed path: **Render / Railway / Fly.io** (backend container) +
+**Vercel** (frontend) + **Neon / Supabase** (Postgres) — all have free tiers.
+
 ## Notes
 
 - **No OpenAI key required to run.** `agent.py` degrades gracefully to a

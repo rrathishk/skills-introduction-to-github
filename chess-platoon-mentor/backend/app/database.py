@@ -1,216 +1,220 @@
 """
 database.py
 ===========
-Local SQLite persistence layer for the Command Center.
+Persistence layer for the Command Center.
 
-Responsibilities
-----------------
-* Track each commander's (user's) Elo capability.
-* Track win / loss / draw history.
-* Persist structural-flaw flags that describe recurring weaknesses in a
-  commander's playing style (Lone Ranger Syndrome, Tunnel Vision, Panic
-  Abandonment).
-* Store a rolling diagnostic log of every transmission the agent emits so
-  the War Room can be replayed / audited.
+Portable across **SQLite** (local dev + tests — zero setup, a single file) and
+**Postgres** (production — multi-instance safe). The same code runs on both
+because it uses SQLAlchemy Core; only the connection URL changes.
 
-The database file lives next to this module as ``command_center.db`` so the
-backend is fully self-contained and requires no external services.
+Connection resolution (first match wins):
+1. ``DATABASE_URL`` env var (e.g. ``postgresql+psycopg://user:pass@host/db``)
+2. ``COMMAND_CENTER_DB`` env var → a SQLite file at that path
+3. Default: ``command_center.db`` next to this module
+
+Responsibilities:
+* Track each commander's Elo, win/loss/draw history, and chosen faction.
+* Persist structural-flaw flags (Lone Ranger, Tunnel Vision, Panic).
+* Store a rolling diagnostic log of every agent transmission.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy import (
+    Column,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    insert,
+    inspect,
+    select,
+    text,
+    update,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-DB_PATH = os.environ.get(
-    "COMMAND_CENTER_DB",
-    os.path.join(os.path.dirname(__file__), "command_center.db"),
+FLAW_KEYS = ("lone_ranger", "tunnel_vision", "panic_abandonment")
+DEFAULT_ELO = 800
+DEFAULT_FACTION = "india"
+
+
+def _resolve_url() -> str:
+    """Build the SQLAlchemy connection URL from the environment."""
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        # Normalise the bare ``postgres://`` form some hosts hand out.
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+psycopg://", 1)
+        return url
+    path = os.environ.get(
+        "COMMAND_CENTER_DB",
+        os.path.join(os.path.dirname(__file__), "command_center.db"),
+    )
+    return f"sqlite:///{path}"
+
+
+# The engine is created lazily so tests can set env vars before first use.
+_engine = None
+_metadata = MetaData()
+
+commanders = Table(
+    "commanders",
+    _metadata,
+    Column("user_id", String(128), primary_key=True),
+    Column("elo", Integer, nullable=False, default=DEFAULT_ELO),
+    Column("wins", Integer, nullable=False, default=0),
+    Column("losses", Integer, nullable=False, default=0),
+    Column("draws", Integer, nullable=False, default=0),
+    Column("flaw_counts", Text, nullable=False, default="{}"),
+    Column("difficulty_bias", Integer, nullable=False, default=0),
+    Column("faction", String(32), nullable=False, default=DEFAULT_FACTION),
+    Column("created_at", Float, nullable=False),
+    Column("updated_at", Float, nullable=False),
 )
 
-# Canonical list of the structural flaws the diagnostic engine can flag.
-FLAW_KEYS = ("lone_ranger", "tunnel_vision", "panic_abandonment")
+match_history = Table(
+    "match_history",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", String(128), nullable=False, index=True),
+    Column("level", Integer, nullable=False),
+    Column("result", String(8), nullable=False),  # win | loss | draw
+    Column("elo_delta", Integer, nullable=False),
+    Column("created_at", Float, nullable=False),
+)
 
-# Default Elo assigned to a brand-new commander.
-DEFAULT_ELO = 800
+diagnostics = Table(
+    "diagnostics",
+    _metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("user_id", String(128), nullable=False, index=True),
+    Column("level", Integer),
+    Column("move", String(16)),
+    Column("fen", Text),
+    Column("flaws", Text),          # JSON array
+    Column("transmission", Text),
+    Column("created_at", Float, nullable=False),
+)
 
 
-# ---------------------------------------------------------------------------
-# Connection helpers
-# ---------------------------------------------------------------------------
-
-@contextmanager
-def _connect() -> Iterator[sqlite3.Connection]:
-    """Yield a SQLite connection with row access by column name."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def get_engine():
+    global _engine
+    if _engine is None:
+        url = _resolve_url()
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+        _engine = create_engine(url, future=True, pool_pre_ping=True, connect_args=connect_args)
+    return _engine
 
 
 def init_db() -> None:
-    """Create all tables if they do not already exist. Idempotent."""
-    with _connect() as conn:
-        cur = conn.cursor()
+    """Create tables if absent + apply the lightweight `faction` migration."""
+    engine = get_engine()
+    _metadata.create_all(engine)
 
-        # One row per commander. ``flaw_counts`` is a JSON blob mapping every
-        # FLAW_KEY to the number of times it has been observed.
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS commanders (
-                user_id         TEXT PRIMARY KEY,
-                elo             INTEGER NOT NULL DEFAULT 800,
-                wins            INTEGER NOT NULL DEFAULT 0,
-                losses          INTEGER NOT NULL DEFAULT 0,
-                draws           INTEGER NOT NULL DEFAULT 0,
-                flaw_counts     TEXT    NOT NULL DEFAULT '{}',
-                difficulty_bias INTEGER NOT NULL DEFAULT 0,
-                faction         TEXT    NOT NULL DEFAULT 'india',
-                created_at      REAL    NOT NULL,
-                updated_at      REAL    NOT NULL
+    # Migration for databases created before `faction` existed.
+    insp = inspect(engine)
+    cols = {c["name"] for c in insp.get_columns("commanders")}
+    if "faction" not in cols:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE commanders ADD COLUMN faction VARCHAR(32) "
+                    "NOT NULL DEFAULT 'india'"
+                )
             )
-            """
-        )
-
-        # Lightweight migration: add `faction` to pre-existing databases.
-        cols = {row["name"] for row in cur.execute("PRAGMA table_info(commanders)")}
-        if "faction" not in cols:
-            cur.execute(
-                "ALTER TABLE commanders ADD COLUMN faction TEXT NOT NULL DEFAULT 'india'"
-            )
-
-        # Append-only log of every match result.
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS match_history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT NOT NULL,
-                level      INTEGER NOT NULL,
-                result     TEXT NOT NULL,        -- 'win' | 'loss' | 'draw'
-                elo_delta  INTEGER NOT NULL,
-                created_at REAL NOT NULL
-            )
-            """
-        )
-
-        # Append-only diagnostic transmission log.
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS diagnostics (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT NOT NULL,
-                level      INTEGER,
-                move       TEXT,
-                fen        TEXT,
-                flaws      TEXT,                 -- JSON array of flaw keys
-                transmission TEXT,               -- the agent's spoken analysis
-                created_at REAL NOT NULL
-            )
-            """
-        )
-        conn.commit()
 
 
 # ---------------------------------------------------------------------------
 # Commander records
 # ---------------------------------------------------------------------------
 
-def _row_to_commander(row: sqlite3.Row) -> Dict[str, Any]:
-    data = dict(row)
+def _row_to_commander(row) -> Dict[str, Any]:
+    data = dict(row._mapping)
     data["flaw_counts"] = json.loads(data.get("flaw_counts") or "{}")
     return data
 
 
 def get_or_create_commander(user_id: str) -> Dict[str, Any]:
-    """Return the commander record, creating a default one if needed."""
+    engine = get_engine()
     now = time.time()
-    with _connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM commanders WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(commanders).where(commanders.c.user_id == user_id)
+        ).first()
         if row is None:
-            cur.execute(
-                """
-                INSERT INTO commanders
-                    (user_id, elo, wins, losses, draws, flaw_counts,
-                     difficulty_bias, created_at, updated_at)
-                VALUES (?, ?, 0, 0, 0, '{}', 0, ?, ?)
-                """,
-                (user_id, DEFAULT_ELO, now, now),
+            conn.execute(
+                insert(commanders).values(
+                    user_id=user_id,
+                    elo=DEFAULT_ELO,
+                    wins=0,
+                    losses=0,
+                    draws=0,
+                    flaw_counts="{}",
+                    difficulty_bias=0,
+                    faction=DEFAULT_FACTION,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-            conn.commit()
-            cur.execute("SELECT * FROM commanders WHERE user_id = ?", (user_id,))
-            row = cur.fetchone()
+            row = conn.execute(
+                select(commanders).where(commanders.c.user_id == user_id)
+            ).first()
         return _row_to_commander(row)
 
 
 def set_faction(user_id: str, faction_id: str) -> Dict[str, Any]:
-    """Persist the commander's chosen army faction."""
     commander = get_or_create_commander(user_id)
-    with _connect() as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            "UPDATE commanders SET faction = ?, updated_at = ? WHERE user_id = ?",
-            (faction_id, time.time(), user_id),
+            update(commanders)
+            .where(commanders.c.user_id == user_id)
+            .values(faction=faction_id, updated_at=time.time())
         )
-        conn.commit()
     commander["faction"] = faction_id
     return commander
 
 
 def record_flaws(user_id: str, flaw_keys: List[str]) -> Dict[str, Any]:
     """
-    Increment the observed counters for the supplied flaws and return the
-    updated commander record.
-
-    If any single flaw has now been observed >= 3 times the commander's
-    ``difficulty_bias`` is lowered (more negative == easier) so the adaptive
-    guidance layer can scale the scenario down.
+    Increment observed flaw counters and return the updated commander. If any
+    flaw reaches >= 3 observations, lower ``difficulty_bias`` (more negative ==
+    easier) so adaptive guidance can scale the scenario down.
     """
     commander = get_or_create_commander(user_id)
     counts: Dict[str, int] = commander["flaw_counts"]
-
     for key in flaw_keys:
         if key in FLAW_KEYS:
             counts[key] = counts.get(key, 0) + 1
 
-    # Adaptive scaling: if the commander keeps repeating *any* flaw, ease off.
     bias = commander["difficulty_bias"]
     if any(v >= 3 for v in counts.values()):
         bias = max(bias - 1, -3)
 
-    now = time.time()
-    with _connect() as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE commanders
-               SET flaw_counts = ?, difficulty_bias = ?, updated_at = ?
-             WHERE user_id = ?
-            """,
-            (json.dumps(counts), bias, now, user_id),
+            update(commanders)
+            .where(commanders.c.user_id == user_id)
+            .values(flaw_counts=json.dumps(counts), difficulty_bias=bias, updated_at=time.time())
         )
-        conn.commit()
-
     commander["flaw_counts"] = counts
     commander["difficulty_bias"] = bias
     return commander
 
 
 def dominant_flaw(user_id: str) -> Optional[str]:
-    """
-    Return the flaw key the commander struggles with most *if* it has been
-    observed at least 3 times (the threshold at which adaptive guidance kicks
-    in). Otherwise return None.
-    """
+    """Return the most-observed flaw if seen >= 3 times, else None."""
     commander = get_or_create_commander(user_id)
     counts: Dict[str, int] = commander["flaw_counts"]
     if not counts:
@@ -220,15 +224,9 @@ def dominant_flaw(user_id: str) -> Optional[str]:
 
 
 def record_result(user_id: str, level: int, result: str) -> Dict[str, Any]:
-    """
-    Apply a win/loss/draw to the commander's Elo and history.
-
-    A simplified fixed-K Elo update is used: wins move the rating up, losses
-    move it down, scaled by the scenario level so harder missions matter more.
-    """
+    """Apply a win/loss/draw to the commander's Elo and append match history."""
     commander = get_or_create_commander(user_id)
     elo = commander["elo"]
-
     base = 12 + (level * 4)
     if result == "win":
         delta = base
@@ -236,38 +234,29 @@ def record_result(user_id: str, level: int, result: str) -> Dict[str, Any]:
     elif result == "loss":
         delta = -base
         commander["losses"] += 1
-    else:  # draw
+    else:
         delta = 0
         commander["draws"] += 1
-
     elo = max(100, elo + delta)
     now = time.time()
 
-    with _connect() as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE commanders
-               SET elo = ?, wins = ?, losses = ?, draws = ?, updated_at = ?
-             WHERE user_id = ?
-            """,
-            (
-                elo,
-                commander["wins"],
-                commander["losses"],
-                commander["draws"],
-                now,
-                user_id,
-            ),
+            update(commanders)
+            .where(commanders.c.user_id == user_id)
+            .values(
+                elo=elo,
+                wins=commander["wins"],
+                losses=commander["losses"],
+                draws=commander["draws"],
+                updated_at=now,
+            )
         )
         conn.execute(
-            """
-            INSERT INTO match_history (user_id, level, result, elo_delta, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user_id, level, result, delta, now),
+            insert(match_history).values(
+                user_id=user_id, level=level, result=result, elo_delta=delta, created_at=now
+            )
         )
-        conn.commit()
-
     commander["elo"] = elo
     return commander
 
@@ -284,58 +273,42 @@ def log_diagnostic(
     flaws: List[str],
     transmission: str,
 ) -> None:
-    """Append a single diagnostic transmission to the audit log."""
-    with _connect() as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            INSERT INTO diagnostics
-                (user_id, level, move, fen, flaws, transmission, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                level,
-                move,
-                fen,
-                json.dumps(flaws),
-                transmission,
-                time.time(),
-            ),
+            insert(diagnostics).values(
+                user_id=user_id,
+                level=level,
+                move=move,
+                fen=fen,
+                flaws=json.dumps(flaws),
+                transmission=transmission,
+                created_at=time.time(),
+            )
         )
-        conn.commit()
 
 
 def get_diagnostics(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Return the most recent diagnostic transmissions, newest first."""
-    with _connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT * FROM diagnostics
-             WHERE user_id = ?
-             ORDER BY id DESC
-             LIMIT ?
-            """,
-            (user_id, limit),
-        )
-        rows = cur.fetchall()
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(diagnostics)
+            .where(diagnostics.c.user_id == user_id)
+            .order_by(diagnostics.c.id.desc())
+            .limit(limit)
+        ).all()
     result = []
     for row in rows:
-        item = dict(row)
+        item = dict(row._mapping)
         item["flaws"] = json.loads(item.get("flaws") or "[]")
         result.append(item)
     return result
 
 
 def get_match_history(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-    """Return the commander's recent match results, newest first."""
-    with _connect() as conn:
-        cur = conn.execute(
-            """
-            SELECT * FROM match_history
-             WHERE user_id = ?
-             ORDER BY id DESC
-             LIMIT ?
-            """,
-            (user_id, limit),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            select(match_history)
+            .where(match_history.c.user_id == user_id)
+            .order_by(match_history.c.id.desc())
+            .limit(limit)
+        ).all()
+    return [dict(r._mapping) for r in rows]

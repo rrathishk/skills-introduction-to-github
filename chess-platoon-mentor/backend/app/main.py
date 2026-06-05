@@ -22,6 +22,8 @@ Active board positions are held in an in-memory session map keyed by
 
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -39,16 +41,29 @@ from .engine import (
 )
 from .factions import FACTIONS, faction_public, get_faction
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create tables / run migrations once, when the server boots.
+    db.init_db()
+    yield
+
+
 app = FastAPI(
     title="Psychological Chess Platoon Command Center",
     description="AI tactical mentor that models chess as psychological warfare.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
-# Allow the Next.js dev server (and any local front-end) to talk to us.
+# CORS: in dev allow everything; in production set CORS_ORIGINS to a
+# comma-separated allowlist of your real front-end domains.
+_origins_env = os.environ.get("CORS_ORIGINS", "*")
+_allow_origins = ["*"] if _origins_env.strip() == "*" else [
+    o.strip() for o in _origins_env.split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,17 +73,10 @@ agent = CommandAgent()
 
 # ---------------------------------------------------------------------------
 # In-memory session store: user_id -> {"level": int, "fen": str, "history": []}
+# NOTE: single-instance only. For multi-instance production, move this to the
+# database or Redis (tracked as a follow-up — see README "Production status").
 # ---------------------------------------------------------------------------
 _SESSIONS: Dict[str, Dict] = {}
-
-# Ensure the schema exists as soon as the module loads (covers both ASGI
-# startup and direct import in tests/tools).
-db.init_db()
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    db.init_db()
 
 
 # ---------------------------------------------------------------------------

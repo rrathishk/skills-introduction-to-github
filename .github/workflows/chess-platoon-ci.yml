@@ -1,0 +1,82 @@
+name: Chess Platoon CI
+
+# Runs on every push / PR that touches the project.
+on:
+  push:
+    paths:
+      - "chess-platoon-mentor/**"
+      - ".github/workflows/chess-platoon-ci.yml"
+  pull_request:
+    paths:
+      - "chess-platoon-mentor/**"
+      - ".github/workflows/chess-platoon-ci.yml"
+
+defaults:
+  run:
+    working-directory: chess-platoon-mentor/backend
+
+jobs:
+  # ---- Backend tests on SQLite (fast, no services) ----------------------
+  backend-sqlite:
+    name: Backend tests (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest
+
+  # ---- Backend tests on real Postgres (proves the DB abstraction) -------
+  backend-postgres:
+    name: Backend tests (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cc
+          POSTGRES_PASSWORD: cc
+          POSTGRES_DB: command_center
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://cc:cc@localhost:5432/command_center
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest
+
+  # ---- Frontend type-check + production build ---------------------------
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chess-platoon-mentor/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm run build
+
+  # ---- Docker image builds cleanly --------------------------------------
+  docker-build:
+    name: Backend Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t chess-platoon-backend .
