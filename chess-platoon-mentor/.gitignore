@@ -1,0 +1,19 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+backend/app/command_center.db
+*.db
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+
+# Env — keep template .env, ignore real secrets
+.env.local
+backend/.env.real
+
+# OS
+.DS_Store

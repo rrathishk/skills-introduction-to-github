@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(circle at 20% 10%, rgba(94, 243, 140, 0.06), transparent 40%),
+    radial-gradient(circle at 80% 90%, rgba(255, 179, 71, 0.05), transparent 45%),
+    #0a0e0a;
+  color: #d4e0cf;
+}
+
+/* Subtle scanline texture for the War Room aesthetic. */
+.scanlines::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0px,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, 0.12) 3px
+  );
+  z-index: 50;
+}
+
+/* Blinking "live link" indicator. */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.pulse-dot {
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+/* Comms feed auto-scroll container. */
+.comms-feed {
+  scrollbar-width: thin;
+  scrollbar-color: #1f2b1a transparent;
+}
+.comms-feed::-webkit-scrollbar {
+  width: 8px;
+}
+.comms-feed::-webkit-scrollbar-thumb {
+  background: #1f2b1a;
+  border-radius: 8px;
+}
